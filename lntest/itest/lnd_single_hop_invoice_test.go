@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcutil"
-	"github.com/lightningnetwork/lnd/chainreg"
+    "github.com/lightningnetwork/lnd/chainreg"	
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lntest"
@@ -23,7 +23,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Open a channel with 100k satoshi between Alice and Bob with Alice being
 	// the sole funder of the channel.
-	chanAmt := btcutil.Amount(100000)
+	chanAmt := btcutil.Amount(100_000)
 	chanPointAliceBob := openChannelAndAssert(
 		t, net, net.Alice, net.Bob,
 		lntest.OpenChannelParams{
@@ -55,6 +55,16 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 		Hash:  *bobChanTXID,
 		Index: chanPointBobCarol.OutputIndex,
 	}
+
+    // Bob set channel policy
+    maxHtlc := calculateMaxHtlc(chanAmt)	
+	const bobBaseFeeSat = 0	
+	const bobFeeRatePPM = 0	
+	updateChannelPolicy(	
+		t, net.Bob, chanPointBobCarol, bobBaseFeeSat*1000,	
+		bobFeeRatePPM, chainreg.DefaultBitcoinTimeLockDelta, maxHtlc,	
+		Carol,	
+	)
 
 	// Wait for channel open gossip to spread
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
@@ -90,8 +100,8 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	if err != nil {
 		t.Fatalf("unable to create pay reqs: %v", err)
 	}
-
-	// subscribe to htlc events
+	
+    // subscribe to htlc events
 	ctxt, cancel := context.WithTimeout(ctxb, defaultTimeout)
 	defer cancel()
 	aliceEvents, err := net.Alice.RouterClient.SubscribeHtlcEvents(
@@ -126,7 +136,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	assertAmountPaid(t, "Bob(local) => Carol(remote)", Carol,
 		bobFundPoint, int64(0), int64(paymentAmt))
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice,
-		aliceFundPoint, expectedAmountPaid, int64(0))
+		aliceFundPoint, int64(paymentAmt), int64(0))
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob,
 		aliceFundPoint, int64(0), int64(paymentAmt))
 
