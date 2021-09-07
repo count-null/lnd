@@ -1,240 +1,155 @@
 package itest
 
 import (
-	"bytes"
 	"context"
-	"encoding/hex"
+	"github.com/btcsuite/btcd/wire"
 	"time"
 
 	"github.com/btcsuite/btcutil"
-	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lntest"
-	"github.com/lightningnetwork/lnd/lntest/wait"
-	"github.com/lightningnetwork/lnd/lntypes"
-	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/record"
-	"github.com/stretchr/testify/require"
 )
 
 func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	ctxb := context.Background()
 
-	// Open a channel with 100k satoshis between Alice and Bob with Alice being
+	// Create new node for Carol
+	Carol := net.NewNode(t.t, "Carol", nil)
+	defer shutdownAndAssert(net, t, Carol)
+
+	net.ConnectNodes(t.t, net.Bob, Carol)
+
+	// Open a channel with 100k satoshi between Alice and Bob with Alice being
 	// the sole funder of the channel.
 	chanAmt := btcutil.Amount(100000)
-	chanPoint := openChannelAndAssert(
+	chanPointAliceBob := openChannelAndAssert(
 		t, net, net.Alice, net.Bob,
 		lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
 	)
-
-	// Now that the channel is open, create an invoice for Bob which
-	// expects a payment of 1000 satoshis from Alice paid via a particular
-	// preimage.
-	const paymentAmt = 1000
-	preimage := bytes.Repeat([]byte("A"), 32)
-	invoice := &lnrpc.Invoice{
-		Memo:      "testing",
-		RPreimage: preimage,
-		Value:     paymentAmt,
-	}
-	invoiceResp, err := net.Bob.AddInvoice(ctxb, invoice)
+	aliceChanTXID, err := lnrpc.GetChanPointFundingTxid(chanPointAliceBob)
 	if err != nil {
-		t.Fatalf("unable to add invoice: %v", err)
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	aliceFundPoint := wire.OutPoint{
+		Hash:  *aliceChanTXID,
+		Index: chanPointAliceBob.OutputIndex,
 	}
 
-	// Wait for Alice to recognize and advertise the new channel generated
-	// above.
+	// Open a channel with 100k satoshi between Bob and Carol with Bob being
+	// the sole funder of the channel.
+	chanPointBobCarol := openChannelAndAssert(
+		t, net, net.Bob, Carol,
+		lntest.OpenChannelParams{
+			Amt: chanAmt,
+		},
+	)
+	bobChanTXID, err := lnrpc.GetChanPointFundingTxid(chanPointBobCarol)
+	if err != nil {
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	bobFundPoint := wire.OutPoint{
+		Hash:  *bobChanTXID,
+		Index: chanPointBobCarol.OutputIndex,
+	}
+
+	// Wait for channel open gossip to spread
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
-	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPointAliceBob)
 	if err != nil {
 		t.Fatalf("alice didn't advertise channel before "+
 			"timeout: %v", err)
 	}
-	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPointAliceBob)
 	if err != nil {
 		t.Fatalf("bob didn't advertise channel before "+
 			"timeout: %v", err)
 	}
-
-	// With the invoice for Bob added, send a payment towards Alice paying
-	// to the above generated invoice.
-	resp := sendAndAssertSuccess(
-		t, net.Alice, &routerrpc.SendPaymentRequest{
-			PaymentRequest: invoiceResp.PaymentRequest,
-			TimeoutSeconds: 60,
-			FeeLimitMsat:   noFeeLimitMsat,
-		},
-	)
-	if hex.EncodeToString(preimage) != resp.PaymentPreimage {
-		t.Fatalf("preimage mismatch: expected %v, got %v", preimage,
-			resp.PaymentPreimage)
-	}
-
-	// Bob's invoice should now be found and marked as settled.
-	payHash := &lnrpc.PaymentHash{
-		RHash: invoiceResp.RHash,
-	}
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	dbInvoice, err := net.Bob.LookupInvoice(ctxt, payHash)
+	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPointBobCarol)
 	if err != nil {
-		t.Fatalf("unable to lookup invoice: %v", err)
+		t.Fatalf("bob didn't advertise channel before "+
+			"timeout: %v", err)
 	}
-	if !dbInvoice.Settled { // nolint:staticcheck
-		t.Fatalf("bob's invoice should be marked as settled: %v",
-			spew.Sdump(dbInvoice))
+	err = Carol.WaitForNetworkChannelOpen(ctxt, chanPointBobCarol)
+	if err != nil {
+		t.Fatalf("carol didn't advertise channel before "+
+			"timeout: %v", err)
 	}
 
-	// With the payment completed all balance related stats should be
-	// properly updated.
-	err = wait.NoError(
-		assertAmountSent(paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
+	time.Sleep(time.Millisecond * 50)
+
+	// Carol creates payment request for 1000 sats
+	const numPayments = 1
+	const paymentAmt = 100
+	payReqs, _, _, err := createPayReqs(
+		Carol, paymentAmt, numPayments,
 	)
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("unable to create pay reqs: %v", err)
 	}
 
-	// Create another invoice for Bob, this time leaving off the preimage
-	// to one will be randomly generated. We'll test the proper
-	// encoding/decoding of the zpay32 payment requests.
-	invoice = &lnrpc.Invoice{
-		Memo:  "test3",
-		Value: paymentAmt,
-	}
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	invoiceResp, err = net.Bob.AddInvoice(ctxt, invoice)
-	if err != nil {
-		t.Fatalf("unable to add invoice: %v", err)
-	}
-
-	// Next send another payment, but this time using a zpay32 encoded
-	// invoice rather than manually specifying the payment details.
-	sendAndAssertSuccess(
-		t, net.Alice, &routerrpc.SendPaymentRequest{
-			PaymentRequest: invoiceResp.PaymentRequest,
-			TimeoutSeconds: 60,
-			FeeLimitMsat:   noFeeLimitMsat,
-		},
-	)
-
-	// The second payment should also have succeeded, with the balances
-	// being update accordingly.
-	err = wait.NoError(
-		assertAmountSent(2*paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
+	// subscribe to htlc events
+	ctxt, cancel := context.WithTimeout(ctxb, defaultTimeout)
+	defer cancel()
+	aliceEvents, err := net.Alice.RouterClient.SubscribeHtlcEvents(
+		ctxt, &routerrpc.SubscribeHtlcEventsRequest{},
 	)
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("could not subscribe events: %v", err)
 	}
-
-	// Next send a keysend payment.
-	keySendPreimage := lntypes.Preimage{3, 4, 5, 11}
-	keySendHash := keySendPreimage.Hash()
-
-	sendAndAssertSuccess(
-		t, net.Alice, &routerrpc.SendPaymentRequest{
-			Dest:           net.Bob.PubKey[:],
-			Amt:            paymentAmt,
-			FinalCltvDelta: 40,
-			PaymentHash:    keySendHash[:],
-			DestCustomRecords: map[uint64][]byte{
-				record.KeySendType: keySendPreimage[:],
-			},
-			TimeoutSeconds: 60,
-			FeeLimitMsat:   noFeeLimitMsat,
-		},
-	)
-
-	// The keysend payment should also have succeeded, with the balances
-	// being update accordingly.
-	err = wait.NoError(
-		assertAmountSent(3*paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
+	bobEvents, err := net.Bob.RouterClient.SubscribeHtlcEvents(
+		ctxt, &routerrpc.SubscribeHtlcEventsRequest{},
 	)
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("could not subscribe events: %v", err)
 	}
-
-	// Assert that the invoice has the proper AMP fields set, since the
-	// legacy keysend payment should have been promoted into an AMP payment
-	// internally.
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	keysendInvoice, err := net.Bob.LookupInvoice(
-		ctxt, &lnrpc.PaymentHash{
-			RHash: keySendHash[:],
-		},
+	carolEvents, err := Carol.RouterClient.SubscribeHtlcEvents(
+		ctxt, &routerrpc.SubscribeHtlcEventsRequest{},
 	)
-	require.NoError(t.t, err)
-	require.Equal(t.t, 1, len(keysendInvoice.Htlcs))
-	htlc := keysendInvoice.Htlcs[0]
-	require.Equal(t.t, uint64(0), htlc.MppTotalAmtMsat)
-	require.Nil(t.t, htlc.Amp)
-
-	// Now create an invoice and specify routing hints.
-	// We will test that the routing hints are encoded properly.
-	hintChannel := lnwire.ShortChannelID{BlockHeight: 10}
-	bobPubKey := hex.EncodeToString(net.Bob.PubKey[:])
-	hints := []*lnrpc.RouteHint{
-		{
-			HopHints: []*lnrpc.HopHint{
-				{
-					NodeId:                    bobPubKey,
-					ChanId:                    hintChannel.ToUint64(),
-					FeeBaseMsat:               1,
-					FeeProportionalMillionths: 1000000,
-					CltvExpiryDelta:           20,
-				},
-			},
-		},
-	}
-
-	invoice = &lnrpc.Invoice{
-		Memo:       "hints",
-		Value:      paymentAmt,
-		RouteHints: hints,
-	}
-
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	invoiceResp, err = net.Bob.AddInvoice(ctxt, invoice)
 	if err != nil {
-		t.Fatalf("unable to add invoice: %v", err)
-	}
-	payreq, err := net.Bob.DecodePayReq(ctxt, &lnrpc.PayReqString{PayReq: invoiceResp.PaymentRequest})
-	if err != nil {
-		t.Fatalf("failed to decode payment request %v", err)
-	}
-	if len(payreq.RouteHints) != 1 {
-		t.Fatalf("expected one routing hint")
-	}
-	routingHint := payreq.RouteHints[0]
-	if len(routingHint.HopHints) != 1 {
-		t.Fatalf("expected one hop hint")
-	}
-	hopHint := routingHint.HopHints[0]
-	if hopHint.FeeProportionalMillionths != 1000000 {
-		t.Fatalf("wrong FeeProportionalMillionths %v",
-			hopHint.FeeProportionalMillionths)
-	}
-	if hopHint.NodeId != bobPubKey {
-		t.Fatalf("wrong NodeId %v",
-			hopHint.NodeId)
-	}
-	if hopHint.ChanId != hintChannel.ToUint64() {
-		t.Fatalf("wrong ChanId %v",
-			hopHint.ChanId)
-	}
-	if hopHint.FeeBaseMsat != 1 {
-		t.Fatalf("wrong FeeBaseMsat %v",
-			hopHint.FeeBaseMsat)
-	}
-	if hopHint.CltvExpiryDelta != 20 {
-		t.Fatalf("wrong CltvExpiryDelta %v",
-			hopHint.CltvExpiryDelta)
+		t.Fatalf("could not subscribe events: %v", err)
 	}
 
-	closeChannelAndAssert(t, net, net.Alice, chanPoint, false)
+	// Alice pays Carol's invoice
+	err = completePaymentRequests(net.Alice, net.Alice.RouterClient, payReqs, true)
+	if err != nil {
+		t.Fatalf("unable to send payments: %v", err)
+	}
+
+	// Check each node's amount paid in the HTLC
+
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob,
+		bobFundPoint, int64(paymentAmt), int64(0))
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", Carol,
+		bobFundPoint, int64(0), int64(paymentAmt))
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice,
+		aliceFundPoint, expectedAmountPaid, int64(0))
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob,
+		aliceFundPoint, int64(0), int64(paymentAmt))
+
+	// Alice should have SEND event
+	assertHtlcEvents(
+		t, numPayments, 0, numPayments, routerrpc.HtlcEvent_SEND,
+		aliceEvents,
+	)
+
+	// Bob should have FORWARD event 
+	assertHtlcEvents(
+		t, numPayments, 0, numPayments, routerrpc.HtlcEvent_FORWARD,
+		bobEvents,
+	)
+
+	// Carol should have RECEIVE event
+	assertHtlcEvents(
+		t, 0, 0, numPayments, routerrpc.HtlcEvent_RECEIVE,
+		carolEvents,
+	)
+	
+	// end test
+	closeChannelAndAssert(t, net, net.Alice, chanPointAliceBob, false)
+	closeChannelAndAssert(t, net, net.Bob, chanPointBobCarol, false)
+
 }
